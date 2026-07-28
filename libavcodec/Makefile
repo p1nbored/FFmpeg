@@ -17,6 +17,7 @@ HEADERS = ac3_parser.h                                                  \
           dxva2.h                                                       \
           jni.h                                                         \
           mediacodec.h                                                  \
+          ohcodec_buffer.h                                              \
           packet.h                                                      \
           qsv.h                                                         \
           smpte_436m.h                                                  \
