@@ -49,6 +49,28 @@
 
 #define OH_DOVI_QUEUE_SIZE 64
 
+/*
+ * HarmonyOS smart fluency (intelligent frame retention), available since
+ * API 26.0.0. The OH_MD_KEY_VIDEO_DECODER_FRAME_RETENTION_MODE/SPEED keys
+ * and the OH_FrameRetentionMode enum come from native_avcodec_base.h (pulled
+ * in via native_avcodec_videodecoder.h). The two key symbols are referenced
+ * weakly so that libmpv stays loadable on systems older than API 26.0.0; on
+ * those devices the feature is simply inactive.
+ */
+extern const char *OH_MD_KEY_VIDEO_DECODER_FRAME_RETENTION_MODE
+    __attribute__((weak));
+extern const char *OH_MD_KEY_VIDEO_DECODER_SPEED
+    __attribute__((weak));
+
+/* Engage ADAPTIVE only when fps * speed exceeds this effective frame rate. */
+#define OH_FLUENCY_EFFECTIVE_FPS_LIMIT 120.0
+
+static bool oh_fluency_supported(void)
+{
+    return OH_MD_KEY_VIDEO_DECODER_FRAME_RETENTION_MODE != NULL &&
+           OH_MD_KEY_VIDEO_DECODER_SPEED != NULL;
+}
+
 typedef struct OHCodecDecQueueItem {
     uint32_t index;
     OH_AVBuffer *buffer;
@@ -105,6 +127,11 @@ typedef struct OHCodecDecContext {
 
     char *name;
     int allow_sw;
+
+    /* Smart fluency state: last applied OH_FrameRetentionMode (-1 if none)
+     * and the speed last forwarded to the decoder in ADAPTIVE mode. */
+    int fluency_mode;
+    double fluency_speed;
 } OHCodecDecContext;
 
 struct AVOHCodecBuffer {
@@ -365,6 +392,12 @@ static int oh_decode_set_format(OHCodecDecContext *s, AVCodecContext *avctx)
     else
         OH_AVFormat_SetIntValue(format, OH_MD_KEY_PIXEL_FORMAT,
                                 AV_PIXEL_FORMAT_SURFACE_FORMAT);
+    if (oh_fluency_supported()) {
+        /* Smart fluency baseline: start in full passthrough. The runtime
+         * path switches to ADAPTIVE when fps * speed exceeds 120. */
+        OH_AVFormat_SetIntValue(format, OH_MD_KEY_VIDEO_DECODER_FRAME_RETENTION_MODE,
+                                OH_FRAME_RETENTION_MODE_FULL);
+    }
     OH_AVErrCode err = OH_VideoDecoder_Configure(s->dec, format);
     OH_AVFormat_Destroy(format);
     if (err != AV_ERR_OK) {
@@ -373,6 +406,8 @@ static int oh_decode_set_format(OHCodecDecContext *s, AVCodecContext *avctx)
                err, av_err2str(ret));
         return ret;
     }
+    if (oh_fluency_supported())
+        s->fluency_mode = OH_FRAME_RETENTION_MODE_FULL;
 
     if (s->output_to_window) {
         err = OH_VideoDecoder_SetSurface(s->dec, window);
@@ -600,6 +635,7 @@ static av_cold int oh_decode_init(AVCodecContext *avctx)
     OHCodecDecContext *s = avctx->priv_data;
 
     atomic_init(&s->accepting_callbacks, false);
+    s->fluency_mode = -1;
     s->dovi_ctx.logctx = avctx;
     if (avctx->codec_id == AV_CODEC_ID_HEVC) {
         const AVPacketSideData *sd =
@@ -691,6 +727,59 @@ int av_ohcodec_release_buffer(AVOHCodecBuffer *buffer, int render)
     err = render ? OH_VideoDecoder_RenderOutputBuffer(ref->dec, buffer->index)
                  : OH_VideoDecoder_FreeOutputBuffer(ref->dec, buffer->index);
     return ff_oh_err_to_ff_err(err);
+}
+
+int av_ohcodec_dec_set_fluency_state(AVCodecContext *avctx, double fps,
+                                     double speed)
+{
+    OHCodecDecContext *s;
+    OH_AVFormat *param;
+    OH_AVErrCode err;
+    int mode;
+
+    if (!avctx || !avctx->codec ||
+        ffcodec(avctx->codec)->init != oh_decode_init)
+        return AVERROR(EINVAL);
+    if (!oh_fluency_supported())
+        return 0;
+    s = avctx->priv_data;
+    if (!s->dec)
+        return 0;
+    /* The threshold cannot be evaluated without both parameters; keep the
+     * current (baseline FULL) mode. */
+    if (!(fps > 0) || !(speed > 0))
+        return 0;
+
+    mode = fps * speed > OH_FLUENCY_EFFECTIVE_FPS_LIMIT
+         ? OH_FRAME_RETENTION_MODE_ADAPTIVE : OH_FRAME_RETENTION_MODE_FULL;
+    if (mode == s->fluency_mode &&
+        (mode != OH_FRAME_RETENTION_MODE_ADAPTIVE || speed == s->fluency_speed))
+        return 0;
+
+    param = OH_AVFormat_Create();
+    if (!param)
+        return AVERROR(ENOMEM);
+    OH_AVFormat_SetIntValue(param, OH_MD_KEY_VIDEO_DECODER_FRAME_RETENTION_MODE,
+                            mode);
+    /* ADAPTIVE requires the current playback speed as calculation basis. */
+    if (mode == OH_FRAME_RETENTION_MODE_ADAPTIVE)
+        OH_AVFormat_SetDoubleValue(param, OH_MD_KEY_VIDEO_DECODER_SPEED, speed);
+    err = OH_VideoDecoder_SetParameter(s->dec, param);
+    OH_AVFormat_Destroy(param);
+    if (err != AV_ERR_OK) {
+        int ret = ff_oh_err_to_ff_err(err);
+        av_log(avctx, AV_LOG_WARNING,
+               "Set smart fluency mode %d failed, %d, %s\n",
+               mode, err, av_err2str(ret));
+        return ret;
+    }
+
+    av_log(avctx, AV_LOG_VERBOSE, "Smart fluency %s: fps %.6g, speed %.6g\n",
+           mode == OH_FRAME_RETENTION_MODE_ADAPTIVE ? "ADAPTIVE" : "FULL",
+           fps, speed);
+    s->fluency_mode = mode;
+    s->fluency_speed = speed;
+    return 0;
 }
 
 static void oh_buffer_release(void *opaque, uint8_t *data)
