@@ -63,7 +63,7 @@ extern const char *OH_MD_KEY_VIDEO_DECODER_SPEED
     __attribute__((weak));
 
 /* Engage ADAPTIVE only when fps * speed exceeds this effective frame rate. */
-#define OH_FLUENCY_EFFECTIVE_FPS_LIMIT 60.0
+#define OH_FLUENCY_EFFECTIVE_FPS_LIMIT 90.0
 
 static bool oh_fluency_supported(void)
 {
@@ -747,7 +747,7 @@ int av_ohcodec_dec_set_fluency_state(AVCodecContext *avctx, double fps,
         return AVERROR(EINVAL);
     s = avctx->priv_data;
 
-    mode = oh_fluency_supported() && fps > 0 && speed > 0 &&
+    mode = oh_fluency_supported() && fps > 0 && speed > 1 &&
            fps * speed > OH_FLUENCY_EFFECTIVE_FPS_LIMIT
          ? OH_FRAME_RETENTION_MODE_ADAPTIVE : OH_FRAME_RETENTION_MODE_FULL;
     if (!s->fluency_logged) {
