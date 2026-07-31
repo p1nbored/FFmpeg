@@ -63,7 +63,7 @@ extern const char *OH_MD_KEY_VIDEO_DECODER_SPEED
     __attribute__((weak));
 
 /* Engage ADAPTIVE only when fps * speed exceeds this effective frame rate. */
-#define OH_FLUENCY_EFFECTIVE_FPS_LIMIT 120.0
+#define OH_FLUENCY_EFFECTIVE_FPS_LIMIT 60.0
 
 static bool oh_fluency_supported(void)
 {
