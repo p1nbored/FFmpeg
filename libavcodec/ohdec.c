@@ -67,8 +67,11 @@ extern const char *OH_MD_KEY_VIDEO_DECODER_SPEED
 
 static bool oh_fluency_supported(void)
 {
-    return OH_MD_KEY_VIDEO_DECODER_FRAME_RETENTION_MODE != NULL &&
-           OH_MD_KEY_VIDEO_DECODER_SPEED != NULL;
+    /* NB: must compare the ADDRESS of the weak symbols. Reading the
+     * variable itself dereferences a NULL GOT entry and crashes on
+     * systems older than API 26.0.0. */
+    return &OH_MD_KEY_VIDEO_DECODER_FRAME_RETENTION_MODE != NULL &&
+           &OH_MD_KEY_VIDEO_DECODER_SPEED != NULL;
 }
 
 typedef struct OHCodecDecQueueItem {
@@ -128,10 +131,12 @@ typedef struct OHCodecDecContext {
     char *name;
     int allow_sw;
 
-    /* Smart fluency state: last applied OH_FrameRetentionMode (-1 if none)
-     * and the speed last forwarded to the decoder in ADAPTIVE mode. */
+    /* Smart fluency state: last applied OH_FrameRetentionMode (-1 if none),
+     * the speed last forwarded to the decoder in ADAPTIVE mode, and whether
+     * the one-time diagnostic line has been logged. */
     int fluency_mode;
     double fluency_speed;
+    bool fluency_logged;
 } OHCodecDecContext;
 
 struct AVOHCodecBuffer {
@@ -740,18 +745,26 @@ int av_ohcodec_dec_set_fluency_state(AVCodecContext *avctx, double fps,
     if (!avctx || !avctx->codec ||
         ffcodec(avctx->codec)->init != oh_decode_init)
         return AVERROR(EINVAL);
-    if (!oh_fluency_supported())
-        return 0;
     s = avctx->priv_data;
-    if (!s->dec)
+
+    mode = oh_fluency_supported() && fps > 0 && speed > 0 &&
+           fps * speed > OH_FLUENCY_EFFECTIVE_FPS_LIMIT
+         ? OH_FRAME_RETENTION_MODE_ADAPTIVE : OH_FRAME_RETENTION_MODE_FULL;
+    if (!s->fluency_logged) {
+        av_log(avctx, AV_LOG_INFO,
+               "Smart fluency %s: fps %.6g, speed %.6g -> %s\n",
+               oh_fluency_supported() ? "supported" : "unavailable (API < 26)",
+               fps, speed,
+               mode == OH_FRAME_RETENTION_MODE_ADAPTIVE ? "ADAPTIVE" : "FULL");
+        s->fluency_logged = true;
+    }
+    if (!oh_fluency_supported() || !s->dec)
         return 0;
     /* The threshold cannot be evaluated without both parameters; keep the
      * current (baseline FULL) mode. */
     if (!(fps > 0) || !(speed > 0))
         return 0;
 
-    mode = fps * speed > OH_FLUENCY_EFFECTIVE_FPS_LIMIT
-         ? OH_FRAME_RETENTION_MODE_ADAPTIVE : OH_FRAME_RETENTION_MODE_FULL;
     if (mode == s->fluency_mode &&
         (mode != OH_FRAME_RETENTION_MODE_ADAPTIVE || speed == s->fluency_speed))
         return 0;
@@ -774,7 +787,7 @@ int av_ohcodec_dec_set_fluency_state(AVCodecContext *avctx, double fps,
         return ret;
     }
 
-    av_log(avctx, AV_LOG_VERBOSE, "Smart fluency %s: fps %.6g, speed %.6g\n",
+    av_log(avctx, AV_LOG_INFO, "Smart fluency %s applied: fps %.6g, speed %.6g\n",
            mode == OH_FRAME_RETENTION_MODE_ADAPTIVE ? "ADAPTIVE" : "FULL",
            fps, speed);
     s->fluency_mode = mode;
@@ -1099,6 +1112,9 @@ static void oh_decode_flush(AVCodecContext *avctx)
     if (OH_VideoDecoder_Start(s->dec) != AV_ERR_OK)
         atomic_store_explicit(&s->accepting_callbacks, false,
                               memory_order_release);
+    /* Retention mode persistence across Flush is undocumented. Invalidate
+     * the cached state so the runtime path re-asserts it on the next frame. */
+    s->fluency_mode = -1;
 }
 
 static const AVCodecHWConfigInternal *const oh_hw_configs[] = {
