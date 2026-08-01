@@ -137,6 +137,12 @@ typedef struct OHCodecDecContext {
     int fluency_mode;
     double fluency_speed;
     bool fluency_logged;
+
+    /* Variable refresh rate (VRR, API 15): last applied enable state and the
+     * content frame rate last forwarded to the decoder. vrr_enabled == -1
+     * means "not yet applied". */
+    int vrr_enabled;
+    int32_t vrr_fps;
 } OHCodecDecContext;
 
 struct AVOHCodecBuffer {
@@ -641,6 +647,7 @@ static av_cold int oh_decode_init(AVCodecContext *avctx)
 
     atomic_init(&s->accepting_callbacks, false);
     s->fluency_mode = -1;
+    s->vrr_enabled = -1;
     s->dovi_ctx.logctx = avctx;
     if (avctx->codec_id == AV_CODEC_ID_HEVC) {
         const AVPacketSideData *sd =
@@ -792,6 +799,61 @@ int av_ohcodec_dec_set_fluency_state(AVCodecContext *avctx, double fps,
            fps, speed);
     s->fluency_mode = mode;
     s->fluency_speed = speed;
+    return 0;
+}
+
+int av_ohcodec_dec_set_vrr(AVCodecContext *avctx, int32_t fps, int enable)
+{
+    OHCodecDecContext *s;
+    OH_AVFormat *param;
+    OH_AVErrCode err;
+    int want;
+
+    if (!avctx || !avctx->codec ||
+        ffcodec(avctx->codec)->init != oh_decode_init)
+        return AVERROR(EINVAL);
+    s = avctx->priv_data;
+    if (!s->dec)
+        return 0;
+    /* VRR only takes effect for hardware decode direct-to-surface; setting it
+     * in buffer-copy mode is a harmless no-op, so skip the call entirely. */
+    if (!s->output_to_window)
+        return 0;
+    /* Enabling requires a valid content frame rate (see OH_MD_KEY_FRAME_RATE
+     * dependency in the VRR guide). Disabling needs none. */
+    if (enable && fps <= 0)
+        return 0;
+
+    want = enable ? 1 : 0;
+    if (want == s->vrr_enabled && (!enable || fps == s->vrr_fps))
+        return 0;
+
+    param = OH_AVFormat_Create();
+    if (!param)
+        return AVERROR(ENOMEM);
+    if (enable) {
+        OH_AVFormat_SetIntValue(param, OH_MD_KEY_FRAME_RATE, fps);
+        OH_AVFormat_SetIntValue(param,
+                                OH_MD_KEY_VIDEO_DECODER_OUTPUT_ENABLE_VRR, 1);
+    } else {
+        OH_AVFormat_SetIntValue(param,
+                                OH_MD_KEY_VIDEO_DECODER_OUTPUT_ENABLE_VRR, 0);
+    }
+    err = OH_VideoDecoder_SetParameter(s->dec, param);
+    OH_AVFormat_Destroy(param);
+    if (err != AV_ERR_OK) {
+        int ret = ff_oh_err_to_ff_err(err);
+        av_log(avctx, AV_LOG_WARNING,
+               "Set VRR enable=%d fps=%d failed, %d, %s\n",
+               enable, fps, err, av_err2str(ret));
+        return ret;
+    }
+
+    av_log(avctx, AV_LOG_INFO, "VRR %s: fps=%d\n",
+           enable ? "enabled" : "disabled", fps);
+    s->vrr_enabled = want;
+    if (enable)
+        s->vrr_fps = fps;
     return 0;
 }
 
@@ -1115,6 +1177,8 @@ static void oh_decode_flush(AVCodecContext *avctx)
     /* Retention mode persistence across Flush is undocumented. Invalidate
      * the cached state so the runtime path re-asserts it on the next frame. */
     s->fluency_mode = -1;
+    /* Same reasoning for VRR: re-assert on the next frame. */
+    s->vrr_enabled = -1;
 }
 
 static const AVCodecHWConfigInternal *const oh_hw_configs[] = {
